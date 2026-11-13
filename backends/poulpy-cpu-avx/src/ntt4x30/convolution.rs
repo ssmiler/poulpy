@@ -29,8 +29,8 @@ use poulpy_cpu_portable::kernels::ntt4x30::{mat_vec::BbcMeta, primes::Primes30};
 use poulpy_cpu_portable::kernels::{RightRead, right_read_ntt};
 use poulpy_hal::execution::TaskExecutor;
 use poulpy_hal::layouts::{
-    Backend, CnvPVecLBackendMut, CnvPVecLBackendRef, CnvPVecRBackendMut, CnvPVecRBackendRef, CrtWord, HostDataMut, HostDataRef,
-    Module, VecZnxBackendRef, VecZnxDftBackendMut, ZnxView, ZnxViewMut, check_degree,
+    Backend, CnvDftAccTerm, CnvPVecLBackendMut, CnvPVecLBackendRef, CnvPVecRBackendMut, CnvPVecRBackendRef, CrtWord, HostDataMut,
+    HostDataRef, Module, VecZnxBackendRef, VecZnxDftBackendMut, ZnxView, ZnxViewMut, check_cnv_dft_terms, check_degree,
 };
 use std::mem::size_of;
 
@@ -506,4 +506,208 @@ pub(crate) unsafe fn cnv_pairwise_apply_dft<BE, E: TaskExecutor>(
 
 pub(crate) fn cnv_by_const_apply_tmp_bytes(_res_size: usize, _a_size: usize, _b_size: usize) -> usize {
     0
+}
+
+/// Terms fused in one pass of [`cnv_apply_dft_sum`].
+const SUM_TERMS: usize = 16;
+
+/// One term of a fused sum of convolutions.
+#[derive(Clone, Copy)]
+struct SumTerm {
+    /// Left and right columns, from their first row.
+    a: *const u32,
+    b: *const u32,
+    a_size: usize,
+    b_size: usize,
+    b_read: RightRead,
+    /// The [`RightRead::lane_table`] of `b_read`.
+    b_lanes: [[u8; GROUP]; GROUP],
+    offset: usize,
+    /// Output limbs the term contributes to.
+    limbs: usize,
+}
+
+// The columns are only read, and outlive the tasks that share them.
+unsafe impl Send for SumTerm {}
+unsafe impl Sync for SumTerm {}
+
+/// Adds the products of `rows` rows to the slot accumulators. The caller keeps `rows` within the
+/// [`CENTERED_TERMS`] products [`signed_redc_canonical`] accepts, so the loop has no fold and no count.
+#[inline(always)]
+unsafe fn sum_rows<const CONTIGUOUS: bool>(
+    acc: &mut [__m256i; GROUP],
+    a_row: *const u32,
+    b_row: *const u32,
+    rows: usize,
+    slots: &[usize; GROUP],
+) {
+    let row_len = 4 * GROUP;
+    unsafe {
+        // One pointer per slot, computed once for the batch.
+        let b_slots: [*const u32; GROUP] = std::array::from_fn(|l| b_row.add(if CONTIGUOUS { 4 * l } else { slots[l] }));
+        for row in 0..rows {
+            let off = row * row_len;
+            for (l, acc) in acc.iter_mut().enumerate() {
+                *acc = _mm256_add_epi64(
+                    *acc,
+                    _mm256_mul_epi32(load_coeff(a_row.add(off), l), load_coeff(b_slots[l].add(off), 0)),
+                );
+            }
+        }
+    }
+}
+
+/// One group of `GROUP` slots of `res[res_col]`, limbs `0..limbs`, summed over `terms`.
+/// Limbs below `written` add to the stored value; the others overwrite it.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+unsafe fn conv_sum_group(
+    res: SendPtr<u32>,
+    res_col: usize,
+    n: usize,
+    res_cols: usize,
+    limbs: usize,
+    written: usize,
+    group: usize,
+    terms: &[SumTerm],
+) {
+    let row_len = 4 * GROUP;
+    // Per term: row-0 offset of the group's slots in `b`, their offsets within a row, and whether they are in order.
+    let mut layout = [(0usize, [0usize; GROUP], true); SUM_TERMS];
+    for (dst, term) in layout.iter_mut().zip(terms) {
+        let (src, key) = term.b_read.block::<GROUP>(group);
+        let lanes = &term.b_lanes[key];
+        *dst = (
+            packed_row_offset(term.b_size, 0, src),
+            std::array::from_fn(|l| 4 * lanes[l] as usize),
+            lanes.iter().enumerate().all(|(l, &x)| x as usize == l),
+        );
+    }
+    unsafe {
+        let q = _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i);
+        let qinv = _mm256_loadu_si256(QINV.as_ptr() as *const __m256i);
+        let zero = _mm256_setzero_si256();
+        for k in 0..limbs {
+            let mut value = [zero; GROUP];
+            let mut acc = [zero; GROUP];
+            let mut count = 0;
+            for (term, (base, slots, contiguous)) in terms.iter().zip(&layout) {
+                if k >= term.limbs {
+                    continue;
+                }
+                let k_abs = k + term.offset;
+                let j_min = k_abs.saturating_sub(term.a_size - 1);
+                let j_max = (k_abs + 1).min(term.b_size);
+                let mut a_row = term.a.add(packed_row_offset(term.a_size, k_abs + 1 - j_max, group));
+                let mut b_row = term.b.add(base + (term.b_size - j_max) * row_len);
+                let mut left = j_max - j_min;
+                // Batches that end at a fold, so the row loop carries neither the count nor `value`.
+                while left > 0 {
+                    let take = left.min(CENTERED_TERMS - count);
+                    if *contiguous {
+                        sum_rows::<true>(&mut acc, a_row, b_row, take, slots);
+                    } else {
+                        sum_rows::<false>(&mut acc, a_row, b_row, take, slots);
+                    }
+                    (a_row, b_row) = (a_row.add(take * row_len), b_row.add(take * row_len));
+                    left -= take;
+                    count += take;
+                    if count == CENTERED_TERMS {
+                        for (value, acc) in value.iter_mut().zip(acc.iter_mut()) {
+                            *value = add_mod_canonical(*value, signed_redc_canonical(*acc, q, qinv), q);
+                            *acc = zero;
+                        }
+                        count = 0;
+                    }
+                }
+            }
+            if count > 0 {
+                for (value, &acc) in value.iter_mut().zip(&acc) {
+                    *value = add_mod_canonical(*value, signed_redc_canonical(acc, q, qinv), q);
+                }
+            }
+            let dst = res.get().add((k * res_cols + res_col) * 4 * n + group * row_len);
+            for pair in 0..GROUP / 2 {
+                let (mut value0, mut value1) = (value[2 * pair], value[2 * pair + 1]);
+                let dst = dst.add(pair * 8) as *mut __m256i;
+                if k < written {
+                    let old = _mm256_loadu_si256(dst);
+                    value0 = add_mod_canonical(value0, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(old)), q);
+                    value1 = add_mod_canonical(value1, _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(old)), q);
+                }
+                _mm256_storeu_si256(dst, pack_two_q120(value0, value1));
+            }
+        }
+    }
+}
+
+pub(crate) fn cnv_apply_dft_sum_tmp_bytes() -> usize {
+    0
+}
+
+/// `res[res_col] = sum_t a_t (x) sigma_{b_galois_t}(b_t)`, the terms of each group of [`SUM_TERMS`] accumulated in one pass.
+///
+/// An output limb is reduced and stored once per group of terms, where the per-term fallback reduces, reads and writes
+/// it for every term.
+pub(crate) unsafe fn cnv_apply_dft_sum<BE, E: TaskExecutor>(
+    module: &Module<BE>,
+    cnv_offset: usize,
+    res: &mut VecZnxDftBackendMut<'_, BE>,
+    res_col: usize,
+    terms: &[CnvDftAccTerm<'_, BE>],
+) where
+    BE: Backend<DftWord = CrtWord<Primes30, u32>, ZnxWord = i64>,
+    for<'a> BE::BufRef<'a>: HostDataRef,
+    for<'a> BE::BufMut<'a>: HostDataMut,
+{
+    let (n, res_size, res_cols) = (res.n(), res.size(), res.cols());
+    check_degree::<BE>(module.n(), n);
+    assert!(res_col < res_cols, "convolution: result column out of range");
+    check_cnv_dft_terms::<BE>(n, terms);
+    // Limbs written so far: a group overwrites the limbs no earlier group reached and adds to the others.
+    let mut written = 0;
+    for chunk in terms.chunks(SUM_TERMS) {
+        let mut limbs = 0;
+        let sum_terms: Vec<SumTerm> = chunk
+            .iter()
+            .filter_map(|term| {
+                let (a_size, b_size) = (term.a.size(), term.b.size());
+                assert_eq!(term.a.n(), n, "a.n():{} != res.n():{n}", term.a.n());
+                let b_read = right_read_ntt::<BE::Ring>(n, term.b.n(), term.b_galois, BE::MIN_DEGREE);
+                if a_size == 0 || b_size == 0 {
+                    return None;
+                }
+                let bound = a_size + b_size - 1;
+                let offset = cnv_offset.min(bound);
+                let a_raw: &[u32] = cast_slice(term.a.raw());
+                let b_raw: &[u32] = cast_slice(term.b.raw());
+                let t = SumTerm {
+                    a: col_slice(a_raw, n, a_size, term.a_col).as_ptr(),
+                    b: col_slice(b_raw, term.b.n(), b_size, term.b_col).as_ptr(),
+                    a_size,
+                    b_size,
+                    b_read,
+                    b_lanes: b_read.lane_table::<GROUP>(),
+                    offset,
+                    limbs: res_size.min(bound - offset),
+                };
+                limbs = limbs.max(t.limbs);
+                Some(t)
+            })
+            .collect();
+        if limbs == 0 {
+            continue;
+        }
+        let res_u32 = cast_slice_mut::<_, u32>(res.raw_mut());
+        assert!(res_u32.len() >= res_size * res_cols * 4 * n);
+        let res_ptr = SendPtr(res_u32.as_mut_ptr());
+        let sum_terms = &sum_terms[..];
+        E::for_each(n / GROUP, |group| unsafe {
+            conv_sum_group(res_ptr, res_col, n, res_cols, limbs, written, group, sum_terms)
+        });
+        written = written.max(limbs);
+    }
+    for limb in written..res_size {
+        zero_res_limb(res, res_col, limb);
+    }
 }

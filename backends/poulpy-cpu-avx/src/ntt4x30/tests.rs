@@ -413,3 +413,70 @@ poulpy_hal::backend_test_suite! {
         test_vec_znx_dft_transforms_reject_invalid_operands => poulpy_hal::test_suite::vec_znx_dft::test_vec_znx_dft_transforms_reject_invalid_operands,
     }
 }
+
+/// The fused `cnv_apply_dft_sum` against the HAL per-term default, byte for byte (both store canonical residues):
+/// more terms than one fused group holds, mixed Galois elements and columns, every `cnv_offset`.
+#[test]
+fn test_convolution_sum_many_terms_vs_derived() {
+    use poulpy_hal::{
+        api::{CnvOps, CnvPVecAlloc, ScratchOwnedAlloc, VecZnxDftAlloc, VecZnxFillUniformSourceAll},
+        layouts::{
+            CnvDftAccTerm, CnvPVecLToBackendMut, CnvPVecLToBackendRef, CnvPVecRToBackendMut, CnvPVecRToBackendRef, DataView,
+            ScratchOwned, VecZnxDftToBackendMut, VecZnxToBackendRef,
+        },
+        oep::cnv_apply_dft_sum_derived,
+        source::Source,
+    };
+
+    let n = 64;
+    let (cols, a_size, b_size, res_size) = (2, 6, 5, 11);
+    let module = Module::<NTT4x30Avx>::new(n as u64);
+    let mut source = Source::new([7u8; 32]);
+    let mut a = module.vec_znx_alloc(n, cols, a_size);
+    let mut b = module.vec_znx_alloc(n, cols, b_size);
+    module.vec_znx_fill_uniform_source_all(17, a_size * 17, &mut a, &mut source);
+    module.vec_znx_fill_uniform_source_all(17, b_size * 17, &mut b, &mut source);
+    let mut a_prep = module.cnv_pvec_left_alloc(n, cols, a_size, PrepareHint::Reuse);
+    let mut b_prep = module.cnv_pvec_right_alloc(n, cols, b_size, PrepareHint::Reuse);
+    let mut scratch = ScratchOwned::<NTT4x30Avx>::alloc(1 << 20);
+    module.cnv_pvec_left_prepare(
+        &mut a_prep.to_backend_mut(),
+        &VecZnxToBackendRef::<NTT4x30Avx>::to_backend_ref(&a),
+        &mut scratch.arena(),
+    );
+    module.cnv_pvec_right_prepare(
+        &mut b_prep.to_backend_mut(),
+        &VecZnxToBackendRef::<NTT4x30Avx>::to_backend_ref(&b),
+        &mut scratch.arena(),
+    );
+
+    let res_col = 1;
+    for n_terms in [1usize, 3, 16, 17, 21] {
+        for cnv_offset in 0..res_size + 1 {
+            let terms: Vec<CnvDftAccTerm<'_, NTT4x30Avx>> = (0..n_terms)
+                .map(|t| CnvDftAccTerm {
+                    a: a_prep.to_backend_ref(),
+                    a_col: t % cols,
+                    b: b_prep.to_backend_ref(),
+                    b_col: (t / 2) % cols,
+                    b_galois: [1, 5, -1, 25][t % 4],
+                })
+                .collect();
+            let mut fused = module.vec_znx_dft_alloc(n, 2, res_size);
+            let mut reference = module.vec_znx_dft_alloc(n, 2, res_size);
+            module.cnv_apply_dft_sum(cnv_offset, &mut fused.to_backend_mut(), res_col, &terms, &mut scratch.arena());
+            cnv_apply_dft_sum_derived::<NTT4x30Avx>(
+                &module,
+                cnv_offset,
+                &mut reference.to_backend_mut(),
+                res_col,
+                &terms,
+                &mut scratch.arena(),
+            );
+            assert!(
+                fused.data() == reference.data(),
+                "cnv_apply_dft_sum: {n_terms} terms, cnv_offset={cnv_offset}"
+            );
+        }
+    }
+}
