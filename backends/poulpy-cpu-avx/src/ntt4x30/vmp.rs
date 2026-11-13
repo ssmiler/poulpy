@@ -36,9 +36,7 @@ use core::arch::x86_64::{
 };
 
 use poulpy_core::oep::gglwe_product_digit_output_size;
-use poulpy_cpu_portable::kernels::ntt4x30::{
-    NttDFTExecute, NttFromZnx64, mat_vec::BbcMeta, primes::Primes30, vec_znx_dft::NttModuleHandle,
-};
+use poulpy_cpu_portable::kernels::ntt4x30::{NttDFTExecute, NttFromZnx64, primes::Primes30, vec_znx_dft::NttModuleHandle};
 use poulpy_cpu_portable::kernels::vmp_select::assert_extractable_portable;
 use poulpy_hal::execution::TaskExecutor;
 use poulpy_hal::layouts::{
@@ -363,7 +361,6 @@ unsafe fn vmp_apply_core_avx_pm<const OVERWRITE: bool, E: TaskExecutor>(
     limb_offset: usize,
     nrows: usize,
     ncols: usize,
-    meta: &BbcMeta<Primes30>,
     tmp: &mut [u64],
 ) {
     assert!(n >= 4);
@@ -406,7 +403,7 @@ unsafe fn vmp_apply_core_avx_pm<const OVERWRITE: bool, E: TaskExecutor>(
                 let y_off = bp * bp_stride + col_pmat * col_stride + row_start * 4;
 
                 unsafe {
-                    vec_mat1col_product_blkpair_bbc_pm_avx2(meta, row_max, blkpair_output, x_pm, &pmat_u64[y_off..], pair_stride)
+                    vec_mat1col_product_blkpair_bbc_pm_avx2(row_max, blkpair_output, x_pm, &pmat_u64[y_off..], pair_stride)
                 };
 
                 let blk0 = 2 * bp;
@@ -431,7 +428,7 @@ unsafe fn vmp_apply_core_avx_pm<const OVERWRITE: bool, E: TaskExecutor>(
                 let col_res = col_pmat - limb_offset;
                 let y_off = bp * bp_stride + col_pmat * col_stride + row_start * 4;
                 unsafe {
-                    vec_mat1col_product_blkpair_bbc_pm_avx2(meta, row_max, blkpair_output, x_pm, &pmat_u64[y_off..], pair_stride);
+                    vec_mat1col_product_blkpair_bbc_pm_avx2(row_max, blkpair_output, x_pm, &pmat_u64[y_off..], pair_stride);
                     let base = col_res * 4 * n;
                     let blk0 = 2 * bp;
                     let blk1 = blk0 + 1;
@@ -458,7 +455,7 @@ unsafe fn vmp_apply_core_avx_pm<const OVERWRITE: bool, E: TaskExecutor>(
 }
 
 pub(crate) fn vmp_apply_dft_to_dft_avx<R: Ring, E: TaskExecutor>(
-    module: &Module<NTT4x30Avx<R>>,
+    _module: &Module<NTT4x30Avx<R>>,
     res: &mut VecZnxDftBackendMut<'_, NTT4x30Avx<R>>,
     a: &VecZnxDftBackendRef<'_, NTT4x30Avx<R>>,
     pmat: &VmpPMatBackendRef<'_, NTT4x30Avx<R>>,
@@ -472,29 +469,18 @@ pub(crate) fn vmp_apply_dft_to_dft_avx<R: Ring, E: TaskExecutor>(
     let n = res.n();
     let nrows = pmat.cols_in() * pmat.rows();
     let ncols = pmat.cols_out() * pmat.size();
-    let meta = module.get_bbc_meta();
 
     let res_u32: &mut [u32] = cast_slice_mut(res.raw_mut());
     let a_u32: &[u32] = cast_slice(a.raw());
     let pmat_u64: &[u64] = cast_slice(pmat.data());
 
     unsafe {
-        vmp_apply_core_avx_pm::<true, E>(
-            n,
-            res_u32,
-            a_u32,
-            pmat_u64,
-            limb_offset * pmat.cols_out(),
-            nrows,
-            ncols,
-            meta,
-            tmp,
-        );
+        vmp_apply_core_avx_pm::<true, E>(n, res_u32, a_u32, pmat_u64, limb_offset * pmat.cols_out(), nrows, ncols, tmp);
     }
 }
 
 pub(crate) fn vmp_apply_dft_to_dft_add_avx<R: Ring, E: TaskExecutor>(
-    module: &Module<NTT4x30Avx<R>>,
+    _module: &Module<NTT4x30Avx<R>>,
     res: &mut VecZnxDftBackendMut<'_, NTT4x30Avx<R>>,
     a: &VecZnxDftBackendRef<'_, NTT4x30Avx<R>>,
     pmat: &VmpPMatBackendRef<'_, NTT4x30Avx<R>>,
@@ -508,24 +494,13 @@ pub(crate) fn vmp_apply_dft_to_dft_add_avx<R: Ring, E: TaskExecutor>(
     let n = res.n();
     let nrows = pmat.cols_in() * pmat.rows();
     let ncols = pmat.cols_out() * pmat.size();
-    let meta = module.get_bbc_meta();
 
     let res_u32: &mut [u32] = cast_slice_mut(res.raw_mut());
     let a_u32: &[u32] = cast_slice(a.raw());
     let pmat_u64: &[u64] = cast_slice(pmat.data());
 
     unsafe {
-        vmp_apply_core_avx_pm::<false, E>(
-            n,
-            res_u32,
-            a_u32,
-            pmat_u64,
-            limb_offset * pmat.cols_out(),
-            nrows,
-            ncols,
-            meta,
-            tmp,
-        );
+        vmp_apply_core_avx_pm::<false, E>(n, res_u32, a_u32, pmat_u64, limb_offset * pmat.cols_out(), nrows, ncols, tmp);
     }
 }
 
@@ -548,7 +523,6 @@ pub(crate) fn vmp_apply_digits_strided_tmp_bytes_avx(
 
 /// Applies all gadget digits directly from their interleaved source limbs.
 pub(crate) fn vmp_apply_dft_to_dft_digits_strided_avx<R: Ring, E: TaskExecutor>(
-    module: &Module<NTT4x30Avx<R>>,
     res: &mut VecZnxDftBackendMut<'_, NTT4x30Avx<R>>,
     a: &VecZnxDftBackendRef<'_, NTT4x30Avx<R>>,
     dsize: usize,
@@ -556,12 +530,11 @@ pub(crate) fn vmp_apply_dft_to_dft_digits_strided_avx<R: Ring, E: TaskExecutor>(
     pmat: &VmpPMatBackendRef<'_, NTT4x30Avx<R>>,
     tmp: &mut [u64],
 ) {
-    vmp_apply_dft_to_dft_digits_strided_avx_inner::<_, E>(module, res, a, dsize, product_limbs, pmat, None, tmp)
+    vmp_apply_dft_to_dft_digits_strided_avx_inner::<_, E>(res, a, dsize, product_limbs, pmat, None, tmp)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
-    module: &Module<NTT4x30Avx<R>>,
     res: &mut VecZnxDftBackendMut<'_, NTT4x30Avx<R>>,
     a: &VecZnxDftBackendRef<'_, NTT4x30Avx<R>>,
     dsize: usize,
@@ -584,7 +557,6 @@ fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
     let a_cols = a.cols();
     let a_size = a.size();
     let dnum = pmat.rows();
-    let meta = module.get_bbc_meta();
     let a_u32: &[u32] = cast_slice(a.raw());
     let res_u32: &mut [u32] = cast_slice_mut(res.raw_mut());
     let pmat_u64: &[u64] = cast_slice(pmat.data());
@@ -686,7 +658,7 @@ fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
                 for col_pmat in limb_offset0..prefix_end {
                     let y_off = bp * bp_stride + col_pmat * col_stride + row_start * 4;
                     unsafe {
-                        vec_mat1col_product_blkpair_bbc_pm_avx2(meta, row_max, output0, x0_pm, &pmat_u64[y_off..], pair_stride);
+                        vec_mat1col_product_blkpair_bbc_pm_avx2(row_max, output0, x0_pm, &pmat_u64[y_off..], pair_stride);
                         let base = (col_pmat - limb_offset0) * 4 * n;
                         save_blkpair_digit(n, bp, res_ptr.get().add(base), output0, di == 0);
                     }
@@ -696,7 +668,6 @@ fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
                     let y_off = bp * bp_stride + col_pmat * col_stride + row_start * 4;
                     unsafe {
                         vec_mat1col_product_blkpair_bbc_pm_x2_avx2(
-                            meta,
                             row_max,
                             output0,
                             output1,
@@ -715,7 +686,7 @@ fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
                 for col_pmat in shared_end..col_max0 {
                     let y_off = bp * bp_stride + col_pmat * col_stride + row_start * 4;
                     unsafe {
-                        vec_mat1col_product_blkpair_bbc_pm_avx2(meta, row_max, output0, x0_pm, &pmat_u64[y_off..], pair_stride);
+                        vec_mat1col_product_blkpair_bbc_pm_avx2(row_max, output0, x0_pm, &pmat_u64[y_off..], pair_stride);
                         let base = (col_pmat - limb_offset0) * 4 * n;
                         save_blkpair_digit(n, bp, res_ptr.get().add(base), output0, di == 0);
                     }
@@ -724,7 +695,7 @@ fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
                 for col_pmat in shared_end.max(limb_offset1)..col_max1 {
                     let y_off = bp * bp_stride + col_pmat * col_stride + row_start * 4;
                     unsafe {
-                        vec_mat1col_product_blkpair_bbc_pm_avx2(meta, row_max, output1, x1_pm, &pmat_u64[y_off..], pair_stride);
+                        vec_mat1col_product_blkpair_bbc_pm_avx2(row_max, output1, x1_pm, &pmat_u64[y_off..], pair_stride);
                         let base = (col_pmat - limb_offset1) * 4 * n;
                         save_blkpair_digit(n, bp, res_ptr.get().add(base), output1, false);
                     }
@@ -754,7 +725,7 @@ fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
                 let col_res = col_pmat - limb_offset;
                 let y_off = bp * bp_stride + col_pmat * col_stride + row_start * 4;
                 unsafe {
-                    vec_mat1col_product_blkpair_bbc_pm_avx2(meta, row_max, output0, x0_pm, &pmat_u64[y_off..], pair_stride);
+                    vec_mat1col_product_blkpair_bbc_pm_avx2(row_max, output0, x0_pm, &pmat_u64[y_off..], pair_stride);
                     let base = col_res * 4 * n;
                     save_blkpair_digit(n, bp, res_ptr.get().add(base), output0, di == 0);
                 }

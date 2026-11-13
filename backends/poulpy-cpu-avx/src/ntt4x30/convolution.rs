@@ -25,7 +25,7 @@ use core::arch::x86_64::{
     _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi64,
 };
 use poulpy_cpu_portable::kernels::SendPtr;
-use poulpy_cpu_portable::kernels::ntt4x30::{mat_vec::BbcMeta, primes::Primes30};
+use poulpy_cpu_portable::kernels::ntt4x30::primes::Primes30;
 use poulpy_cpu_portable::kernels::{RightRead, right_read_ntt};
 use poulpy_hal::execution::TaskExecutor;
 use poulpy_hal::layouts::{
@@ -86,7 +86,6 @@ unsafe fn load_coeff(row: *const u32, coeff: usize) -> __m256i {
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 unsafe fn conv_group<const ACC: bool, const PAIRWISE: bool>(
-    _meta: &BbcMeta<Primes30>,
     res: SendPtr<u32>,
     res_col: usize,
     n: usize,
@@ -380,7 +379,6 @@ pub(crate) fn cnv_apply_dft_tmp_bytes(_res_size: usize, _a_size: usize, _b_size:
 #[allow(clippy::too_many_arguments)]
 unsafe fn apply<BE, E: TaskExecutor, const ACC: bool, const PAIRWISE: bool>(
     module: &Module<BE>,
-    meta: &BbcMeta<Primes30>,
     cnv_offset: usize,
     res: &mut VecZnxDftBackendMut<'_, BE>,
     res_col: usize,
@@ -423,7 +421,7 @@ unsafe fn apply<BE, E: TaskExecutor, const ACC: bool, const PAIRWISE: bool>(
     let b_lanes = b_read.lane_table::<GROUP>();
     E::for_each(n / GROUP, |group| unsafe {
         conv_group::<ACC, PAIRWISE>(
-            meta, res_ptr, res_col, n, res_cols, min_size, offset, group, a0, a1, a_size, b0, b1, b_size, b_read, &b_lanes,
+            res_ptr, res_col, n, res_cols, min_size, offset, group, a0, a1, a_size, b0, b1, b_size, b_read, &b_lanes,
         )
     });
     if !ACC {
@@ -436,7 +434,6 @@ unsafe fn apply<BE, E: TaskExecutor, const ACC: bool, const PAIRWISE: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn cnv_apply_dft<BE, E: TaskExecutor>(
     module: &Module<BE>,
-    meta: &BbcMeta<Primes30>,
     cnv_offset: usize,
     res: &mut VecZnxDftBackendMut<'_, BE>,
     res_col: usize,
@@ -450,17 +447,12 @@ pub(crate) unsafe fn cnv_apply_dft<BE, E: TaskExecutor>(
     for<'a> BE::BufRef<'a>: HostDataRef,
     for<'a> BE::BufMut<'a>: HostDataMut,
 {
-    unsafe {
-        apply::<BE, E, false, false>(
-            module, meta, cnv_offset, res, res_col, a, a_col, a_col, b, b_col, b_col, b_galois,
-        )
-    };
+    unsafe { apply::<BE, E, false, false>(module, cnv_offset, res, res_col, a, a_col, a_col, b, b_col, b_col, b_galois) };
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn cnv_apply_dft_add<BE, E: TaskExecutor>(
     module: &Module<BE>,
-    meta: &BbcMeta<Primes30>,
     cnv_offset: usize,
     res: &mut VecZnxDftBackendMut<'_, BE>,
     res_col: usize,
@@ -474,17 +466,12 @@ pub(crate) unsafe fn cnv_apply_dft_add<BE, E: TaskExecutor>(
     for<'a> BE::BufRef<'a>: HostDataRef,
     for<'a> BE::BufMut<'a>: HostDataMut,
 {
-    unsafe {
-        apply::<BE, E, true, false>(
-            module, meta, cnv_offset, res, res_col, a, a_col, a_col, b, b_col, b_col, b_galois,
-        )
-    };
+    unsafe { apply::<BE, E, true, false>(module, cnv_offset, res, res_col, a, a_col, a_col, b, b_col, b_col, b_galois) };
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn cnv_pairwise_apply_dft<BE, E: TaskExecutor>(
     module: &Module<BE>,
-    meta: &BbcMeta<Primes30>,
     cnv_offset: usize,
     res: &mut VecZnxDftBackendMut<'_, BE>,
     res_col: usize,
@@ -498,9 +485,9 @@ pub(crate) unsafe fn cnv_pairwise_apply_dft<BE, E: TaskExecutor>(
     for<'a> BE::BufMut<'a>: HostDataMut,
 {
     if i == j {
-        unsafe { apply::<BE, E, false, false>(module, meta, cnv_offset, res, res_col, a, i, i, b, i, i, 1) };
+        unsafe { apply::<BE, E, false, false>(module, cnv_offset, res, res_col, a, i, i, b, i, i, 1) };
     } else {
-        unsafe { apply::<BE, E, false, true>(module, meta, cnv_offset, res, res_col, a, i, j, b, i, j, 1) };
+        unsafe { apply::<BE, E, false, true>(module, cnv_offset, res, res_col, a, i, j, b, i, j, 1) };
     }
 }
 

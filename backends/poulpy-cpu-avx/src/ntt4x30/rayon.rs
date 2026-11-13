@@ -20,7 +20,6 @@ mod drivers {
         NttDFTExecute,
         ntt::{NttTable, NttTableInv},
         primes::Primes30,
-        vec_znx_dft::NttModuleHandle,
     };
     use poulpy_cpu_rayon::ntt4x30::PackedWord;
     use poulpy_hal::{
@@ -143,7 +142,7 @@ mod drivers {
     }
 
     pub(super) fn cnv_apply_dft<R: Ring, BE: PackedWord, E: TaskExecutor>(
-        base: &Module<NTT4x30Avx<R>>,
+        _base: &Module<NTT4x30Avx<R>>,
         module: &Module<BE>,
         cnv_offset: usize,
         res: &mut VecZnxDftBackendMut<'_, BE>,
@@ -158,24 +157,11 @@ mod drivers {
         for<'a> BE::BufRef<'a>: HostDataRef,
         for<'a> BE::BufMut<'a>: HostDataMut,
     {
-        unsafe {
-            convolution::cnv_apply_dft::<BE, E>(
-                module,
-                base.get_bbc_meta(),
-                cnv_offset,
-                res,
-                res_col,
-                a,
-                a_col,
-                b,
-                b_col,
-                b_galois,
-            )
-        }
+        unsafe { convolution::cnv_apply_dft::<BE, E>(module, cnv_offset, res, res_col, a, a_col, b, b_col, b_galois) }
     }
 
     pub(super) fn cnv_apply_dft_add<R: Ring, BE: PackedWord, E: TaskExecutor>(
-        base: &Module<NTT4x30Avx<R>>,
+        _base: &Module<NTT4x30Avx<R>>,
         module: &Module<BE>,
         cnv_offset: usize,
         res: &mut VecZnxDftBackendMut<'_, BE>,
@@ -190,24 +176,11 @@ mod drivers {
         for<'a> BE::BufRef<'a>: HostDataRef,
         for<'a> BE::BufMut<'a>: HostDataMut,
     {
-        unsafe {
-            convolution::cnv_apply_dft_add::<BE, E>(
-                module,
-                base.get_bbc_meta(),
-                cnv_offset,
-                res,
-                res_col,
-                a,
-                a_col,
-                b,
-                b_col,
-                b_galois,
-            )
-        }
+        unsafe { convolution::cnv_apply_dft_add::<BE, E>(module, cnv_offset, res, res_col, a, a_col, b, b_col, b_galois) }
     }
 
     pub(super) fn cnv_pairwise_apply_dft<R: Ring, BE: PackedWord, E: TaskExecutor>(
-        base: &Module<NTT4x30Avx<R>>,
+        _base: &Module<NTT4x30Avx<R>>,
         module: &Module<BE>,
         cnv_offset: usize,
         res: &mut VecZnxDftBackendMut<'_, BE>,
@@ -221,7 +194,7 @@ mod drivers {
         for<'a> BE::BufRef<'a>: HostDataRef,
         for<'a> BE::BufMut<'a>: HostDataMut,
     {
-        unsafe { convolution::cnv_pairwise_apply_dft::<BE, E>(module, base.get_bbc_meta(), cnv_offset, res, res_col, a, b, i, j) }
+        unsafe { convolution::cnv_pairwise_apply_dft::<BE, E>(module, cnv_offset, res, res_col, a, b, i, j) }
     }
 }
 
@@ -282,7 +255,7 @@ macro_rules! impl_digits_strided {
             }
 
             fn gglwe_product_digits_strided(
-                module: &Module<Self>,
+                _module: &Module<Self>,
                 res: &mut VecZnxDftBackendMut<'_, Self>,
                 a: &VecZnxDftBackendRef<'_, Self>,
                 dsize: usize,
@@ -303,7 +276,6 @@ macro_rules! impl_digits_strided {
                 let (tmp, _) = crate::hal_impl::take_host_typed::<Self, u64>(scratch.borrow(), bytes / size_of::<u64>());
                 let res_shape = res.shape();
                 vmp::vmp_apply_dft_to_dft_digits_strided_avx::<$ring, RayonTaskExecutor>(
-                    module.reinterpret(),
                     &mut VecZnxDft::from_shape(&mut **res.data_mut(), res_shape),
                     &VecZnxDft::from_shape(&**a.data(), a.shape()),
                     dsize,

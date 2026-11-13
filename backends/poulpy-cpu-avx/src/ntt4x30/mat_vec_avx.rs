@@ -348,7 +348,6 @@ unsafe fn centered_dot(rows: usize, p: usize, mut load: impl FnMut(usize) -> (__
 /// laid out as 16 u64: `[blk0.c0[4], blk0.c1[4], blk1.c0[4], blk1.c1[4]]`.
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_avx2(
-    _meta: &BbcMeta<Primes30>,
     ell: usize,
     res: &mut [u64],
     x_pm: &[u64],
@@ -394,7 +393,6 @@ pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_avx2(
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_x2_avx2(
-    _meta: &BbcMeta<Primes30>,
     ell: usize,
     res0: &mut [u64],
     res1: &mut [u64],
@@ -704,7 +702,6 @@ mod tests {
     /// `(-q/2, q/2]`, with more rows than an accumulator takes between two folds.
     #[test]
     fn vec_mat1col_product_blkpair_bbc_pm_avx2_vs_exact() {
-        let meta = BbcMeta::<Primes30>::new();
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut next = || {
             seed ^= seed << 13;
@@ -778,13 +775,11 @@ mod tests {
             };
 
             let mut res = vec![0u64; 16];
-            unsafe { vec_mat1col_product_blkpair_bbc_pm_avx2(&meta, ell, &mut res, &x_pm, &y_pm, 4 * ell) };
+            unsafe { vec_mat1col_product_blkpair_bbc_pm_avx2(ell, &mut res, &x_pm, &y_pm, 4 * ell) };
             assert_eq!(reduced(&res), exact(&x), "ell={ell}");
 
             let (mut res0, mut res1) = (vec![0u64; 16], vec![0u64; 16]);
-            unsafe {
-                vec_mat1col_product_blkpair_bbc_pm_x2_avx2(&meta, ell, &mut res0, &mut res1, &x_pm, &x1_pm, &y_pm, 4 * ell)
-            };
+            unsafe { vec_mat1col_product_blkpair_bbc_pm_x2_avx2(ell, &mut res0, &mut res1, &x_pm, &x1_pm, &y_pm, 4 * ell) };
             assert_eq!(reduced(&res0), exact(&x), "ell={ell}: x2, first");
             assert_eq!(reduced(&res1), exact(&x1), "ell={ell}: x2, second");
         }

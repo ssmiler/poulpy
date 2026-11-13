@@ -15,7 +15,7 @@ use poulpy_cpu_portable::kernels::{
         NttDFTExecute,
         ntt::{NttTable, NttTableInv},
         primes::Primes30,
-        vec_znx_dft::{NttModuleHandle, NttPlan, NttPlanNew},
+        vec_znx_dft::{NttPlan, NttPlanNew},
     },
     znx::ZnxAutomorphism,
 };
@@ -355,16 +355,7 @@ where
         let _ = scratch;
         unsafe {
             super::ntt4x30::convolution::cnv_apply_dft::<_, SerialTaskExecutor>(
-                module,
-                module.get_bbc_meta(),
-                cnv_offset,
-                res,
-                res_col,
-                a,
-                a_col,
-                b,
-                b_col,
-                b_galois,
+                module, cnv_offset, res, res_col, a, a_col, b, b_col, b_galois,
             )
         };
     }
@@ -419,16 +410,7 @@ where
         let _ = scratch;
         unsafe {
             super::ntt4x30::convolution::cnv_apply_dft_add::<_, SerialTaskExecutor>(
-                module,
-                module.get_bbc_meta(),
-                cnv_offset,
-                res,
-                res_col,
-                a,
-                a_col,
-                b,
-                b_col,
-                b_galois,
+                module, cnv_offset, res, res_col, a, a_col, b, b_col, b_galois,
             )
         };
     }
@@ -458,15 +440,7 @@ where
         let _ = scratch;
         unsafe {
             super::ntt4x30::convolution::cnv_pairwise_apply_dft::<_, SerialTaskExecutor>(
-                module,
-                module.get_bbc_meta(),
-                cnv_offset,
-                res,
-                res_col,
-                a,
-                b,
-                i,
-                j,
+                module, cnv_offset, res, res_col, a, b, i, j,
             )
         };
     }
