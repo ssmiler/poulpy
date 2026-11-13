@@ -1,7 +1,28 @@
+// ----------------------------------------------------------------------
+// DISCLAIMER
+//
+// This module contains code derived from the spqlios-arithmetic library
+// (https://github.com/tfhe/spqlios-arithmetic), which is licensed
+// under the Apache License, Version 2.0.
+//
+// The current implementation is an updated version of the spqlios
+// port. The main changes from the original:
+//   - prepared operands hold centered residues, the right one in
+//     Montgomery form, multiplied as i32;
+//   - accumulators end with one signed Montgomery REDC;
+//   - all slots of a group are processed per row, with constant
+//     offsets when there is no lane permutation.
+//
+// Both Poulpy and spqlios-arithmetic are distributed under the terms
+// of the Apache License, Version 2.0. See the LICENSE file for details.
+//
+// ----------------------------------------------------------------------
+
 use bytemuck::{cast_slice, cast_slice_mut};
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi64, _mm256_and_si256, _mm256_castsi256_si128, _mm256_cvtepu32_epi64, _mm256_extracti128_si256,
-    _mm256_loadu_si256, _mm256_mul_epu32, _mm256_set1_epi64x, _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256,
+    __m256i, _mm256_add_epi32, _mm256_add_epi64, _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi64,
+    _mm256_cvtepu32_epi64, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_setzero_si256,
+    _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi64,
 };
 use poulpy_cpu_portable::kernels::SendPtr;
 use poulpy_cpu_portable::kernels::ntt4x30::{mat_vec::BbcMeta, primes::Primes30};
@@ -14,8 +35,7 @@ use poulpy_hal::layouts::{
 use std::mem::size_of;
 
 use super::{
-    arithmetic_avx::{BARRETT_MU, POW32, Q_VEC, cond_sub, reduce_b_to_canonical},
-    mat_vec_avx::reduce_bbc,
+    arithmetic_avx::{Q_VEC, QINV, QINV_NEG, R2, R3, add_mod_canonical, reduce_b_to_canonical, signed_redc_canonical},
     vec_znx_dft::pack_two_q120,
 };
 const GROUP: usize = 8;
@@ -45,36 +65,18 @@ where
     cast_slice_mut::<_, u32>(res.at_mut(col, limb)).fill(0);
 }
 
-#[inline(always)]
-unsafe fn reduce_accum(meta: &BbcMeta<Primes30>, lo: __m256i, hi: __m256i) -> __m256i {
-    unsafe {
-        let x = reduce_bbc(
-            lo,
-            hi,
-            _mm256_set1_epi64x(((1u64 << meta.h) - 1) as i64),
-            meta.h,
-            _mm256_loadu_si256(meta.s2l_pow_red.as_ptr() as *const __m256i),
-            _mm256_loadu_si256(meta.s2h_pow_red.as_ptr() as *const __m256i),
-        );
-        reduce_b_to_canonical(
-            x,
-            _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i),
-            _mm256_loadu_si256(BARRETT_MU.as_ptr() as *const __m256i),
-            _mm256_loadu_si256(POW32.as_ptr() as *const __m256i),
-        )
-    }
-}
+// Prepared operands hold centered residues `|x| <= (q - 1) / 2` as `i32`; the right operand is in Montgomery
+// form `x · 2^32 mod q`. An accumulator sums signed products from zero and ends with one signed REDC, which
+// drops the `2^32` and needs `|acc| < q · 2^31`: `t` products of magnitude below `q^2 / 4` stay in range
+// while `t * q < 2^33`, so 8 products with `q < 2^30`, and 2 products of pairwise sums (below `q^2`).
+// Longer sums are split into chunks whose canonical results are added mod `q`.
 
-#[inline(always)]
-unsafe fn accumulate_product(lo: &mut __m256i, hi: &mut __m256i, a: __m256i, b: __m256i) {
-    unsafe {
-        let mask32 = _mm256_set1_epi64x(u32::MAX as i64);
-        let product = _mm256_mul_epu32(a, b);
-        *lo = _mm256_add_epi64(*lo, _mm256_and_si256(product, mask32));
-        *hi = _mm256_add_epi64(*hi, _mm256_srli_epi64::<32>(product));
-    }
-}
+/// Products of two centered residues an accumulator takes per chunk.
+const CENTERED_TERMS: usize = 8;
+/// Products of two pairwise sums an accumulator takes per chunk.
+const PAIRWISE_TERMS: usize = 2;
 
+/// The 32-bit word of a residue (in the low word of a 64-bit lane), zero-extended: `_mm256_mul_epi32` reads it as an `i32`.
 #[inline(always)]
 unsafe fn load_coeff(row: *const u32, coeff: usize) -> __m256i {
     unsafe { _mm256_cvtepu32_epi64(core::arch::x86_64::_mm_loadu_si128(row.add(4 * coeff) as *const _)) }
@@ -84,7 +86,7 @@ unsafe fn load_coeff(row: *const u32, coeff: usize) -> __m256i {
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 unsafe fn conv_group<const ACC: bool, const PAIRWISE: bool>(
-    meta: &BbcMeta<Primes30>,
+    _meta: &BbcMeta<Primes30>,
     res: SendPtr<u32>,
     res_col: usize,
     n: usize,
@@ -101,58 +103,96 @@ unsafe fn conv_group<const ACC: bool, const PAIRWISE: bool>(
     b_read: RightRead,
     b_lanes: &[[u8; GROUP]; GROUP],
 ) {
+    // Row-0 offset of the group's slots in `b`; limb rows are `4 * GROUP` u32 apart.
+    let (src, key) = b_read.block::<GROUP>(group);
+    let (base, lanes) = (packed_row_offset(b_size, 0, src), &b_lanes[key]);
+    let slots: [usize; GROUP] = std::array::from_fn(|l| 4 * lanes[l] as usize);
+    // Without a lane permutation (no automorphism), slot `l` of `b` sits at `4 * l`: constant offsets.
+    unsafe {
+        if lanes.iter().enumerate().all(|(l, &x)| x as usize == l) {
+            conv_group_rows::<ACC, PAIRWISE, true>(
+                res, res_col, n, res_cols, min_size, offset, group, a0, a1, a_size, b0, b1, b_size, base, &slots,
+            )
+        } else {
+            conv_group_rows::<ACC, PAIRWISE, false>(
+                res, res_col, n, res_cols, min_size, offset, group, a0, a1, a_size, b0, b1, b_size, base, &slots,
+            )
+        }
+    }
+}
+
+/// All `GROUP` slots of one group at once, one accumulator per slot, so the per-row offsets are shared.
+/// `slots[l]` is the offset of slot `l` within a `b` row (`4 * l` when `CONTIGUOUS`).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn conv_group_rows<const ACC: bool, const PAIRWISE: bool, const CONTIGUOUS: bool>(
+    res: SendPtr<u32>,
+    res_col: usize,
+    n: usize,
+    res_cols: usize,
+    min_size: usize,
+    offset: usize,
+    group: usize,
+    a0: &[u32],
+    a1: &[u32],
+    a_size: usize,
+    b0: &[u32],
+    b1: &[u32],
+    b_size: usize,
+    base: usize,
+    slots: &[usize; GROUP],
+) {
     unsafe {
         let q = _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i);
-        // Row-0 offset of the slot each slot of the group reads; limb rows are `4 * GROUP` u32 apart.
-        let (src, key) = b_read.block::<GROUP>(group);
-        let (base, lanes) = (packed_row_offset(b_size, 0, src), &b_lanes[key]);
-        let b_slots: [usize; GROUP] = std::array::from_fn(|l| base + 4 * lanes[l] as usize);
+        let qinv = _mm256_loadu_si256(QINV.as_ptr() as *const __m256i);
+        let zero = _mm256_setzero_si256();
+        let terms = if PAIRWISE { PAIRWISE_TERMS } else { CENTERED_TERMS };
+        let row_len = 4 * GROUP;
         for k in 0..min_size {
             let k_abs = k + offset;
             let j_min = k_abs.saturating_sub(a_size - 1);
             let j_max = (k_abs + 1).min(b_size);
             let a_start = k_abs + 1 - j_max;
             let b_start = b_size - j_max;
-            for pair in 0..GROUP / 2 {
-                let row0 = b_start * 4 * GROUP;
-                let (b_off0, b_off1) = (b_slots[2 * pair] + row0, b_slots[2 * pair + 1] + row0);
-                let mut lo0 = _mm256_setzero_si256();
-                let mut hi0 = _mm256_setzero_si256();
-                let mut lo1 = _mm256_setzero_si256();
-                let mut hi1 = _mm256_setzero_si256();
-                for row in 0..j_max - j_min {
-                    let ao = packed_row_offset(a_size, a_start + row, group);
-                    let ro = row * 4 * GROUP;
-                    let mut av0 = load_coeff(a0.as_ptr().add(ao), 2 * pair);
-                    let mut av1 = load_coeff(a0.as_ptr().add(ao), 2 * pair + 1);
-                    let mut bv0 = load_coeff(b0.as_ptr().add(b_off0 + ro), 0);
-                    let mut bv1 = load_coeff(b0.as_ptr().add(b_off1 + ro), 0);
-                    if PAIRWISE {
-                        av0 = cond_sub(_mm256_add_epi64(av0, load_coeff(a1.as_ptr().add(ao), 2 * pair)), q);
-                        av1 = cond_sub(_mm256_add_epi64(av1, load_coeff(a1.as_ptr().add(ao), 2 * pair + 1)), q);
-                        bv0 = cond_sub(_mm256_add_epi64(bv0, load_coeff(b1.as_ptr().add(b_off0 + ro), 0)), q);
-                        bv1 = cond_sub(_mm256_add_epi64(bv1, load_coeff(b1.as_ptr().add(b_off1 + ro), 0)), q);
+            let rows = j_max - j_min;
+            let a_base = packed_row_offset(a_size, a_start, group);
+            let b_base = base + b_start * row_len;
+            // Canonical sums of the chunks reduced so far, one per slot.
+            let mut value = [zero; GROUP];
+            let mut row = 0;
+            while row < rows {
+                let end = rows.min(row + terms);
+                let mut acc = [zero; GROUP];
+                while row < end {
+                    let (ao, bo) = (a_base + row * row_len, b_base + row * row_len);
+                    for (l, acc) in acc.iter_mut().enumerate() {
+                        let slot = if CONTIGUOUS { 4 * l } else { slots[l] };
+                        let mut av = load_coeff(a0.as_ptr().add(ao), l);
+                        let mut bv = load_coeff(b0.as_ptr().add(bo + slot), 0);
+                        if PAIRWISE {
+                            // Two centered residues sum to less than `q` in magnitude: their low words stay an exact `i32`.
+                            av = _mm256_add_epi32(av, load_coeff(a1.as_ptr().add(ao), l));
+                            bv = _mm256_add_epi32(bv, load_coeff(b1.as_ptr().add(bo + slot), 0));
+                        }
+                        *acc = _mm256_add_epi64(*acc, _mm256_mul_epi32(av, bv));
                     }
-                    accumulate_product(&mut lo0, &mut hi0, av0, bv0);
-                    accumulate_product(&mut lo1, &mut hi1, av1, bv1);
+                    row += 1;
                 }
-                let value0 = reduce_accum(meta, lo0, hi0);
-                let value1 = reduce_accum(meta, lo1, hi1);
-                let dst = res.get().add((k * res_cols + res_col) * 4 * n + group * 4 * GROUP + pair * 8);
+                for (value, &acc) in value.iter_mut().zip(&acc) {
+                    let r = signed_redc_canonical(acc, q, qinv);
+                    *value = if end <= terms { r } else { add_mod_canonical(*value, r, q) };
+                }
+            }
+            let dst = res.get().add((k * res_cols + res_col) * 4 * n + group * row_len);
+            for pair in 0..GROUP / 2 {
+                let (mut value0, mut value1) = (value[2 * pair], value[2 * pair + 1]);
+                let dst = dst.add(pair * 8) as *mut __m256i;
                 if ACC {
-                    let old = _mm256_loadu_si256(dst as *const __m256i);
-                    let old0 = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(old));
-                    let old1 = _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(old));
-                    _mm256_storeu_si256(
-                        dst as *mut __m256i,
-                        pack_two_q120(
-                            cond_sub(_mm256_add_epi64(old0, value0), q),
-                            cond_sub(_mm256_add_epi64(old1, value1), q),
-                        ),
-                    );
-                } else {
-                    _mm256_storeu_si256(dst as *mut __m256i, pack_two_q120(value0, value1));
+                    let old = _mm256_loadu_si256(dst);
+                    value0 = add_mod_canonical(value0, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(old)), q);
+                    value1 = add_mod_canonical(value1, _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(old)), q);
                 }
+                _mm256_storeu_si256(dst, pack_two_q120(value0, value1));
             }
         }
     }
@@ -163,28 +203,35 @@ pub(crate) fn cnv_pvec_prepare_tmp_bytes(n: usize) -> usize {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn pack_prepared_limb(dst: *mut u32, src: &[u64], n: usize, size: usize, limb: usize) {
+/// `scale` is [`R2`] for plain residues (left operand) or [`R3`] for the Montgomery form (right operand).
+unsafe fn pack_prepared_limb(dst: *mut u32, src: &[u64], n: usize, size: usize, limb: usize, scale: &[u64; 4]) {
     unsafe {
-        let q = _mm256_loadu_si256(super::arithmetic_avx::Q_VEC.as_ptr() as *const __m256i);
-        let mu = _mm256_loadu_si256(super::arithmetic_avx::BARRETT_MU.as_ptr() as *const __m256i);
-        let pow32 = _mm256_loadu_si256(super::arithmetic_avx::POW32.as_ptr() as *const __m256i);
+        let q = _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i);
+        let qinv_neg = _mm256_loadu_si256(QINV_NEG.as_ptr() as *const __m256i);
+        let r2 = _mm256_loadu_si256(scale.as_ptr() as *const __m256i);
+        let half = _mm256_srli_epi64::<1>(q);
+        // The centered residue `x - q` above `(q - 1) / 2`, as the low word of the lane.
+        let center = |x: __m256i| _mm256_sub_epi64(x, _mm256_and_si256(_mm256_cmpgt_epi64(x, half), q));
         for group in 0..n / GROUP {
             let dst_off = packed_row_offset(size, limb, group);
             for pair in 0..GROUP / 2 {
                 let src_off = group * 4 * GROUP + pair * 8;
-                let a = super::arithmetic_avx::reduce_b_to_canonical(
+                let a = reduce_b_to_canonical(
                     _mm256_loadu_si256(src.as_ptr().add(src_off) as *const __m256i),
                     q,
-                    mu,
-                    pow32,
+                    qinv_neg,
+                    r2,
                 );
-                let b = super::arithmetic_avx::reduce_b_to_canonical(
+                let b = reduce_b_to_canonical(
                     _mm256_loadu_si256(src.as_ptr().add(src_off + 4) as *const __m256i),
                     q,
-                    mu,
-                    pow32,
+                    qinv_neg,
+                    r2,
                 );
-                _mm256_storeu_si256(dst.add(dst_off + pair * 8) as *mut __m256i, pack_two_q120(a, b));
+                _mm256_storeu_si256(
+                    dst.add(dst_off + pair * 8) as *mut __m256i,
+                    pack_two_q120(center(a), center(b)),
+                );
             }
         }
     }
@@ -237,15 +284,15 @@ fn prepare<BE, E: TaskExecutor>(
         E::for_each_chunked(task_count, tmp, 4 * n, |tmp, task| unsafe {
             let col = task / size;
             let limb = task % size;
-            let dst_l = left_ptr.map(|ptr| (ptr.get().add(col * stride), limb));
-            let dst_r = right_ptr.map(|ptr| (ptr.get().add(col * stride), size - 1 - limb));
+            let dst_l = left_ptr.map(|ptr| (ptr.get().add(col * stride), limb, &R2));
+            let dst_r = right_ptr.map(|ptr| (ptr.get().add(col * stride), size - 1 - limb, &R3));
             if limb < min_size {
                 dft(n, tmp, a.at(col, limb));
-                for (dst, row) in dst_l.into_iter().chain(dst_r) {
-                    pack_prepared_limb(dst, tmp, n, size, row);
+                for (dst, row, scale) in dst_l.into_iter().chain(dst_r) {
+                    pack_prepared_limb(dst, tmp, n, size, row, scale);
                 }
             } else {
-                for (dst, row) in dst_l.into_iter().chain(dst_r) {
+                for (dst, row, _) in dst_l.into_iter().chain(dst_r) {
                     for group in 0..n / GROUP {
                         std::slice::from_raw_parts_mut(dst.add(packed_row_offset(size, row, group)), 4 * GROUP).fill(0);
                     }
@@ -262,10 +309,10 @@ fn prepare<BE, E: TaskExecutor>(
         for limb in 0..min_size {
             dft(n, tmp, a.at(col, limb));
             if let Some(dst) = dst_l.as_deref_mut() {
-                unsafe { pack_prepared_limb(dst.as_mut_ptr(), tmp, n, size, limb) };
+                unsafe { pack_prepared_limb(dst.as_mut_ptr(), tmp, n, size, limb, &R2) };
             }
             if let Some(dst) = dst_r.as_deref_mut() {
-                unsafe { pack_prepared_limb(dst.as_mut_ptr(), tmp, n, size, size - 1 - limb) };
+                unsafe { pack_prepared_limb(dst.as_mut_ptr(), tmp, n, size, size - 1 - limb, &R3) };
             }
         }
         for limb in min_size..size {

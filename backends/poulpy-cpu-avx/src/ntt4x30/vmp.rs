@@ -1,3 +1,23 @@
+// ----------------------------------------------------------------------
+// DISCLAIMER
+//
+// This module contains code derived from the spqlios-arithmetic library
+// (https://github.com/tfhe/spqlios-arithmetic), which is licensed
+// under the Apache License, Version 2.0.
+//
+// The current implementation is an updated version of the spqlios
+// port. The main changes from the original:
+//   - backend-local prime-major prepared-matrix layout, stored as
+//     centered residues in Montgomery form;
+//   - input rows are centered and transposed into prime planes with
+//     AVX2 instead of scalar code;
+//   - results arrive canonical, so saving only packs or adds mod q.
+//
+// Both Poulpy and spqlios-arithmetic are distributed under the terms
+// of the Apache License, Version 2.0. See the LICENSE file for details.
+//
+// ----------------------------------------------------------------------
+
 //! Vector-matrix product AVX2 kernels for [`NTT4x30Avx`](crate::NTT4x30Avx).
 //!
 //! Uses a backend-local prime-major prepared-matrix layout so the hot AVX VMP
@@ -10,8 +30,9 @@ use std::mem::size_of;
 
 use bytemuck::{cast_slice, cast_slice_mut};
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepu32_epi64, _mm256_extracti128_si256, _mm256_loadu_si256,
-    _mm256_set_epi64x, _mm256_storeu_si256,
+    __m256i, _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi32, _mm256_cvtepi32_epi64, _mm256_cvtepu32_epi64,
+    _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_permutevar8x32_epi32, _mm256_setr_epi32, _mm256_storeu_si256,
+    _mm256_sub_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
 };
 
 use poulpy_core::oep::gglwe_product_digit_output_size;
@@ -25,9 +46,9 @@ use poulpy_hal::layouts::{
     VmpPMatBackendRef, ZnxView, ZnxViewMut, check_degree,
 };
 
-use super::arithmetic_avx::{BARRETT_MU, POW32, Q_VEC, cond_sub, reduce_b_to_canonical};
+use super::arithmetic_avx::{Q_VEC, add_mod_canonical};
 use super::mat_vec_avx::{vec_mat1col_product_blkpair_bbc_pm_avx2, vec_mat1col_product_blkpair_bbc_pm_x2_avx2};
-use super::vec_znx_dft::{canonicalize_limb_q120, pack_two_q120};
+use super::vec_znx_dft::pack_two_q120;
 use crate::NTT4x30Avx;
 
 #[derive(Clone, Copy)]
@@ -43,6 +64,19 @@ impl SendU32Ptr {
     fn get(&self) -> *mut u32 {
         self.0
     }
+}
+
+/// The centered representative in `(-q/2, q/2]` of a canonical residue of `p`-th prime.
+#[inline(always)]
+fn centered(x: u64, p: usize) -> i64 {
+    let q = Q_VEC[p];
+    x as i64 - if x > q / 2 { q as i64 } else { 0 }
+}
+
+/// The centered Montgomery form `x * 2^32 mod q` of any residue `x` of `p`-th prime.
+#[inline(always)]
+fn centered_montgomery(x: u64, p: usize) -> i64 {
+    centered((((x as u128) << 32) % Q_VEC[p] as u128) as u64, p)
 }
 
 /// Scratch space (in bytes) required by the AVX VMP prepare kernel.
@@ -89,7 +123,6 @@ pub(crate) fn vmp_pmat_prepare_avx_pm<R: Ring>(
 
             NTT4x30Avx::<R>::ntt_from_znx64(tmp_b, &mat_i64[pos..pos + n]);
             NTT4x30Avx::<R>::ntt_dft_execute(table, tmp_b);
-            unsafe { canonicalize_limb_q120(n, tmp_b) };
 
             for bp in 0..n_block_pairs {
                 let coeff_base = 16 * bp;
@@ -98,7 +131,11 @@ pub(crate) fn vmp_pmat_prepare_avx_pm<R: Ring>(
                     let dst = pair * pair_stride + bp * bp_stride + col_i * col_stride + row_i * 4;
                     for coeff in 0..4 {
                         let coeff_off = coeff_base + 4 * coeff;
-                        pmat_u64[dst + coeff] = tmp_b[coeff_off + p] | (tmp_b[coeff_off + p + 1] << 32);
+                        let (even, odd) = (
+                            centered_montgomery(tmp_b[coeff_off + p], p),
+                            centered_montgomery(tmp_b[coeff_off + p + 1], p + 1),
+                        );
+                        pmat_u64[dst + coeff] = even as u32 as u64 | ((odd as u32 as u64) << 32);
                     }
                 }
             }
@@ -177,6 +214,52 @@ pub(crate) unsafe fn extract_1blk_from_contiguous_q120b_avx2(n: usize, row_max: 
     }
 }
 
+/// Splits the 16 canonical residues of one row of a block pair (`[c][p]`, 4 coefficients × 4 primes) into the
+/// 4 prime planes: centered residues as `i64`, `[c0, c1, c2, c3]` of prime `p` at `dst + p * plane_stride`.
+#[inline(always)]
+unsafe fn extract_row_planes(src: *const u32, dst: *mut u64, plane_stride: usize) {
+    unsafe {
+        let q = _mm256_setr_epi32(
+            Q_VEC[0] as i32,
+            Q_VEC[1] as i32,
+            Q_VEC[2] as i32,
+            Q_VEC[3] as i32,
+            Q_VEC[0] as i32,
+            Q_VEC[1] as i32,
+            Q_VEC[2] as i32,
+            Q_VEC[3] as i32,
+        );
+        let half = _mm256_setr_epi32(
+            (Q_VEC[0] / 2) as i32,
+            (Q_VEC[1] / 2) as i32,
+            (Q_VEC[2] / 2) as i32,
+            (Q_VEC[3] / 2) as i32,
+            (Q_VEC[0] / 2) as i32,
+            (Q_VEC[1] / 2) as i32,
+            (Q_VEC[2] / 2) as i32,
+            (Q_VEC[3] / 2) as i32,
+        );
+        // Residues are below 2^31, so the signed compare orders them; `x - q` above `q / 2`, as in `centered`.
+        let center = |x: __m256i| _mm256_sub_epi32(x, _mm256_and_si256(_mm256_cmpgt_epi32(x, half), q));
+        // [c0p0..c0p3 c1p0..c1p3] → [c0p0 c1p0 c0p1 c1p1 | c0p2 c1p2 c0p3 c1p3], and likewise for c2, c3.
+        let idx = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        let a = _mm256_permutevar8x32_epi32(center(_mm256_loadu_si256(src as *const __m256i)), idx);
+        let b = _mm256_permutevar8x32_epi32(center(_mm256_loadu_si256(src.add(8) as *const __m256i)), idx);
+        // Low 128 bits: primes 0 / 1 as [c0 c1 c2 c3]; high 128 bits: primes 2 / 3.
+        let even = _mm256_unpacklo_epi64(a, b);
+        let odd = _mm256_unpackhi_epi64(a, b);
+        let planes = [
+            _mm256_castsi256_si128(even),
+            _mm256_castsi256_si128(odd),
+            _mm256_extracti128_si256::<1>(even),
+            _mm256_extracti128_si256::<1>(odd),
+        ];
+        for (p, plane) in planes.into_iter().enumerate() {
+            _mm256_storeu_si256(dst.add(p * plane_stride) as *mut __m256i, _mm256_cvtepi32_epi64(plane));
+        }
+    }
+}
+
 /// Extract one q120b block pair into 4 prime-major planes.
 ///
 /// Each plane stores `row_max` rows of 4 u64 with lane order
@@ -192,16 +275,8 @@ unsafe fn extract_blk_pair_prime_major_avx2(n: usize, row_max: usize, blk_pair: 
 
     for row in 0..row_max {
         let row_base = row * 4 * n + coeff_base;
-        for p in 0..4usize {
-            let dst_ptr = unsafe { dst.as_mut_ptr().add(p * plane_stride + row * 4) as *mut __m256i };
-            let plane = _mm256_set_epi64x(
-                src[row_base + 12 + p] as i64,
-                src[row_base + 8 + p] as i64,
-                src[row_base + 4 + p] as i64,
-                src[row_base + p] as i64,
-            );
-            unsafe { _mm256_storeu_si256(dst_ptr, plane) };
-        }
+        assert!(src.len() >= row_base + 16);
+        unsafe { extract_row_planes(src.as_ptr().add(row_base), dst.as_mut_ptr().add(row * 4), plane_stride) };
     }
 }
 
@@ -230,16 +305,8 @@ unsafe fn extract_blk_pair_prime_major_strided_avx2(
         let digit = logical_row / cols;
         let flat = (limb_base + digit * limb_step) * cols + col;
         let row_base = flat * 4 * n + coeff_base;
-        for p in 0..4usize {
-            let dst_ptr = unsafe { dst.as_mut_ptr().add(p * plane_stride + row * 4) as *mut __m256i };
-            let plane = _mm256_set_epi64x(
-                src[row_base + 12 + p] as i64,
-                src[row_base + 8 + p] as i64,
-                src[row_base + 4 + p] as i64,
-                src[row_base + p] as i64,
-            );
-            unsafe { _mm256_storeu_si256(dst_ptr, plane) };
-        }
+        assert!(src.len() >= row_base + 16);
+        unsafe { extract_row_planes(src.as_ptr().add(row_base), dst.as_mut_ptr().add(row * 4), plane_stride) };
     }
 }
 
@@ -248,11 +315,8 @@ unsafe fn save_blk_overwrite(blk: usize, dst: &mut [u32], src: &[u64]) {
     assert!(src.len() >= 8);
     let off = 8 * blk;
     unsafe {
-        let q = _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i);
-        let mu = _mm256_loadu_si256(BARRETT_MU.as_ptr() as *const __m256i);
-        let pow32 = _mm256_loadu_si256(POW32.as_ptr() as *const __m256i);
-        let a = reduce_b_to_canonical(_mm256_loadu_si256(src.as_ptr() as *const __m256i), q, mu, pow32);
-        let b = reduce_b_to_canonical(_mm256_loadu_si256(src.as_ptr().add(4) as *const __m256i), q, mu, pow32);
+        let a = _mm256_loadu_si256(src.as_ptr() as *const __m256i);
+        let b = _mm256_loadu_si256(src.as_ptr().add(4) as *const __m256i);
         _mm256_storeu_si256(dst.as_mut_ptr().add(off) as *mut __m256i, pack_two_q120(a, b));
     }
 }
@@ -263,16 +327,12 @@ unsafe fn save_blk_add(blk: usize, dst: &mut [u32], src: &[u64]) {
     assert!(dst.len() >= 8 * (blk + 1));
     unsafe {
         let q = _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i);
-        let mu = _mm256_loadu_si256(BARRETT_MU.as_ptr() as *const __m256i);
-        let pow32 = _mm256_loadu_si256(POW32.as_ptr() as *const __m256i);
         let dst_ptr = dst.as_mut_ptr().add(8 * blk) as *mut __m256i;
         let packed = _mm256_loadu_si256(dst_ptr);
         let d0 = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(packed));
         let d1 = _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(packed));
-        let s0 = reduce_b_to_canonical(_mm256_loadu_si256(src.as_ptr() as *const __m256i), q, mu, pow32);
-        let s1 = reduce_b_to_canonical(_mm256_loadu_si256(src.as_ptr().add(4) as *const __m256i), q, mu, pow32);
-        let r0 = cond_sub(_mm256_add_epi64(d0, s0), q);
-        let r1 = cond_sub(_mm256_add_epi64(d1, s1), q);
+        let r0 = add_mod_canonical(d0, _mm256_loadu_si256(src.as_ptr() as *const __m256i), q);
+        let r1 = add_mod_canonical(d1, _mm256_loadu_si256(src.as_ptr().add(4) as *const __m256i), q);
         _mm256_storeu_si256(dst_ptr, pack_two_q120(r0, r1));
     }
 }
@@ -714,8 +774,42 @@ fn vmp_apply_dft_to_dft_digits_strided_avx_inner<R: Ring, E: TaskExecutor>(
 
 #[cfg(test)]
 mod tests {
-    use super::extract_1blk_from_contiguous_q120b_avx2;
+    use super::{Q_VEC, centered, extract_1blk_from_contiguous_q120b_avx2, extract_row_planes};
     use poulpy_cpu_portable::kernels::ntt4x30::mat_vec::extract_1blk_from_contiguous_q120b_portable;
+
+    /// Vectorized row extraction against the scalar `centered` per prime plane.
+    #[test]
+    fn extract_row_planes_vs_scalar() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut src = [0u32; 16];
+        for round in 0..256 {
+            for (i, v) in src.iter_mut().enumerate() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let q = Q_VEC[i % 4];
+                *v = match round {
+                    0 => 0,
+                    1 => (q - 1) as u32,
+                    2 => (q / 2) as u32,
+                    3 => (q / 2 + 1) as u32,
+                    _ => (seed % q) as u32,
+                };
+            }
+            let plane_stride = 7;
+            let mut dst = vec![0u64; 3 * plane_stride + 4];
+            unsafe { extract_row_planes(src.as_ptr(), dst.as_mut_ptr(), plane_stride) };
+            for p in 0..4 {
+                for c in 0..4 {
+                    assert_eq!(
+                        dst[p * plane_stride + c] as i64,
+                        centered(src[4 * c + p] as u64, p),
+                        "p={p} c={c}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn extract_1blk_from_contiguous_q120b_avx2_vs_ref() {

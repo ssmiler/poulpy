@@ -1,3 +1,20 @@
+// ----------------------------------------------------------------------
+// DISCLAIMER
+//
+// This module contains code derived from the spqlios-arithmetic library
+// (https://github.com/tfhe/spqlios-arithmetic), which is licensed
+// under the Apache License, Version 2.0.
+//
+// The current implementation is an updated version of the spqlios
+// port. The main changes from the original:
+//   - q120b to q120c packing uses the Montgomery reduction
+//     `reduce_b_to_canonical`.
+//
+// Both Poulpy and spqlios-arithmetic are distributed under the terms
+// of the Apache License, Version 2.0. See the LICENSE file for details.
+//
+// ----------------------------------------------------------------------
+
 use bytemuck::{cast_slice, cast_slice_mut};
 use core::arch::x86_64::{
     __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi32,
@@ -20,7 +37,7 @@ use poulpy_hal::layouts::{
 
 use super::{
     NTT4x30Avx,
-    arithmetic_avx::{BARRETT_MU, POW32, Q_VEC, reduce_b_to_canonical},
+    arithmetic_avx::{Q_VEC, QINV_NEG, R2, reduce_b_to_canonical},
 };
 
 const Q32X8: [u32; 8] = [
@@ -69,28 +86,14 @@ pub(crate) unsafe fn pack_limb_q120(n: usize, dst: &mut [u32], src: &[u64]) {
     assert!(src.len() >= 4 * n);
     unsafe {
         let q = _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i);
-        let mu = _mm256_loadu_si256(BARRETT_MU.as_ptr() as *const __m256i);
-        let pow32 = _mm256_loadu_si256(POW32.as_ptr() as *const __m256i);
+        let qinv_neg = _mm256_loadu_si256(QINV_NEG.as_ptr() as *const __m256i);
+        let r2 = _mm256_loadu_si256(R2.as_ptr() as *const __m256i);
         for pair in 0..n / 2 {
             let a = _mm256_loadu_si256(src.as_ptr().add(8 * pair) as *const __m256i);
             let b = _mm256_loadu_si256(src.as_ptr().add(8 * pair + 4) as *const __m256i);
-            let a = reduce_b_to_canonical(a, q, mu, pow32);
-            let b = reduce_b_to_canonical(b, q, mu, pow32);
+            let a = reduce_b_to_canonical(a, q, qinv_neg, r2);
+            let b = reduce_b_to_canonical(b, q, qinv_neg, r2);
             _mm256_storeu_si256(dst.as_mut_ptr().add(8 * pair) as *mut __m256i, pack_two_q120(a, b));
-        }
-    }
-}
-
-#[target_feature(enable = "avx2")]
-pub(crate) unsafe fn canonicalize_limb_q120(n: usize, src: &mut [u64]) {
-    assert!(src.len() >= 4 * n);
-    unsafe {
-        let q = _mm256_loadu_si256(Q_VEC.as_ptr() as *const __m256i);
-        let mu = _mm256_loadu_si256(BARRETT_MU.as_ptr() as *const __m256i);
-        let pow32 = _mm256_loadu_si256(POW32.as_ptr() as *const __m256i);
-        for coeff in 0..n {
-            let ptr = src.as_mut_ptr().add(4 * coeff) as *mut __m256i;
-            _mm256_storeu_si256(ptr, reduce_b_to_canonical(_mm256_loadu_si256(ptr), q, mu, pow32));
         }
     }
 }

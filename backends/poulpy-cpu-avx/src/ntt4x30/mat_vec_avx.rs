@@ -1,14 +1,16 @@
 // ----------------------------------------------------------------------
 // DISCLAIMER
 //
-// This module contains code that has been directly ported from the
-// spqlios-arithmetic library
+// This module contains code derived from the spqlios-arithmetic library
 // (https://github.com/tfhe/spqlios-arithmetic), which is licensed
 // under the Apache License, Version 2.0.
 //
-// The porting process from C to Rust was done with minimal changes
-// in order to preserve the semantics and performance characteristics
-// of the original implementation.
+// The current implementation is an updated version of the spqlios
+// port. The main changes from the original:
+//   - prime-major VMP kernels multiply centered residues as i32
+//     against a matrix stored in Montgomery form;
+//   - each accumulator ends with one signed Montgomery REDC and the
+//     kernels return canonical residues.
 //
 // Both Poulpy and spqlios-arithmetic are distributed under the terms
 // of the Apache License, Version 2.0. See the LICENSE file for details.
@@ -42,11 +44,13 @@
 //! | [`vec_mat2cols_product_x2_bbc_avx2`] | `q120x2_vec_mat2cols_product_bbc_avx2` | [`NttMulBbc2ColsX2`] |
 
 use core::arch::x86_64::{
-    __m256i, _mm_cvtsi64_si128, _mm256_add_epi64, _mm256_and_si256, _mm256_loadu_si256, _mm256_mul_epu32, _mm256_set1_epi64x,
-    _mm256_setzero_si256, _mm256_srl_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
+    __m256i, _mm_cvtsi64_si128, _mm256_add_epi64, _mm256_and_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_mul_epu32,
+    _mm256_set1_epi64x, _mm256_setzero_si256, _mm256_srl_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
 };
 
 use poulpy_cpu_portable::kernels::ntt4x30::{mat_vec::BbcMeta, primes::Primes30};
+
+use super::arithmetic_avx::{Q_VEC, QINV, add_mod_canonical, signed_redc_canonical};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared final-reduction helper
@@ -295,20 +299,56 @@ pub(crate) unsafe fn vec_mat1col_product_x2_bbc_avx2(
 // Block-pair, single column, prime-major input × packed prime-pair matrix
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Rows an accumulator takes per chunk: it sums products of centered residues (magnitude below `q^2 / 4`) from
+/// zero and ends with one signed Montgomery redution, which needs `|acc| < q * 2^31`: 8 products with `q < 2^30`.
+/// Longer sums are split into chunks whose canonical results are added mod `q`.
+const CENTERED_ROWS: usize = 8;
+
+/// `Σ x[row] * y[row] * 2^-32 mod q` over `rows >= 1` rows of one prime lane, canonical in `[0, q)`.
+///
+/// `x` and `y` hold centered residues of that prime in the low 32 bits of each 64-bit lane (`y` shifted down
+/// for an odd prime of the pair), read as `i32` by `_mm256_mul_epi32`; `y` is in Montgomery form `y * 2^32`, so
+/// the result is `Σ x * y`. `load(row)` returns the pair `(x, y)` of a row.
+#[inline(always)]
+unsafe fn centered_dot(rows: usize, p: usize, mut load: impl FnMut(usize) -> (__m256i, __m256i)) -> __m256i {
+    unsafe {
+        let q = _mm256_set1_epi64x(Q_VEC[p] as i64);
+        let qinv = _mm256_set1_epi64x(QINV[p] as i64);
+        let mut value = _mm256_setzero_si256();
+        let mut row = 0;
+        while row < rows {
+            let end = rows.min(row + CENTERED_ROWS);
+            let mut acc = _mm256_setzero_si256();
+            while row < end {
+                let (x, y) = load(row);
+                acc = _mm256_add_epi64(acc, _mm256_mul_epi32(x, y));
+                row += 1;
+            }
+            let r = signed_redc_canonical(acc, q, qinv);
+            value = if end <= CENTERED_ROWS {
+                r
+            } else {
+                add_mod_canonical(value, r, q)
+            };
+        }
+        value
+    }
+}
+
 /// AVX2 block-pair inner product over a prime-major VMP layout.
 ///
 /// `x_pm` contains 4 prime planes. Each plane stores `ell` rows of 4 u64
-/// values with lane order `[blk0.c0, blk0.c1, blk1.c0, blk1.c1]`.
+/// values with lane order `[blk0.c0, blk0.c1, blk1.c0, blk1.c1]`, each a centered residue (as an `i64`).
 ///
 /// `y_pm` contains two prime-pair planes with the same per-row lane order.
-/// Each u64 packs two canonical residues as `p_even | p_odd << 32`.
+/// Each u64 packs two centered residues as `i32` words: `p_even | p_odd << 32`.
 /// `y_pair_stride` is the distance, in u64, between the two planes.
 ///
-/// The output is two standard q120b x2-blocks laid out as 16 u64:
-/// `[blk0.c0[4], blk0.c1[4], blk1.c0[4], blk1.c1[4]]`.
+/// `y` is in Montgomery form (`y * 2^32 mod q`, centered). The output is two x2-blocks of canonical residues
+/// laid out as 16 u64: `[blk0.c0[4], blk0.c1[4], blk1.c0[4], blk1.c1[4]]`.
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_avx2(
-    meta: &BbcMeta<Primes30>,
+    _meta: &BbcMeta<Primes30>,
     ell: usize,
     res: &mut [u64],
     x_pm: &[u64],
@@ -320,55 +360,28 @@ pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_avx2(
         assert!(x_pm.len() >= 16 * ell);
         assert!(y_pm.len() >= y_pair_stride + 4 * ell);
 
-        let mask32 = _mm256_set1_epi64x(u32::MAX as i64);
-        let mask_h2 = _mm256_set1_epi64x(((1u64 << meta.h) - 1) as i64);
         let x_plane_stride = 4 * ell;
         let mut prime_outputs = [0u64; 16];
 
         for p in 0..4usize {
-            let s2l_pow_red = _mm256_set1_epi64x(meta.s2l_pow_red[p] as i64);
-            let s2h_pow_red = _mm256_set1_epi64x(meta.s2h_pow_red[p] as i64);
             let x_ptr = x_pm.as_ptr().add(p * x_plane_stride) as *const __m256i;
             let y_ptr = y_pm.as_ptr().add((p / 2) * y_pair_stride) as *const __m256i;
             let odd_prime = p & 1 != 0;
-
-            let mut s_lo = _mm256_setzero_si256();
-            let mut s_hi = _mm256_setzero_si256();
-
-            for row in 0..ell {
-                let xv = _mm256_loadu_si256(x_ptr.add(row));
+            let out = centered_dot(ell, p, |row| {
                 let yv = _mm256_loadu_si256(y_ptr.add(row));
-                let yv = if odd_prime {
-                    _mm256_srli_epi64::<32>(yv)
-                } else {
-                    _mm256_and_si256(yv, mask32)
-                };
-                let prod = _mm256_mul_epu32(xv, yv);
-
-                s_lo = _mm256_add_epi64(s_lo, _mm256_and_si256(prod, mask32));
-                s_hi = _mm256_add_epi64(s_hi, _mm256_srli_epi64::<32>(prod));
-            }
-
-            let out = reduce_bbc(s_lo, s_hi, mask_h2, meta.h, s2l_pow_red, s2h_pow_red);
+                (
+                    _mm256_loadu_si256(x_ptr.add(row)),
+                    if odd_prime { _mm256_srli_epi64::<32>(yv) } else { yv },
+                )
+            });
             _mm256_storeu_si256(prime_outputs.as_mut_ptr().add(4 * p) as *mut __m256i, out);
         }
 
-        res[0] = prime_outputs[0];
-        res[1] = prime_outputs[4];
-        res[2] = prime_outputs[8];
-        res[3] = prime_outputs[12];
-        res[4] = prime_outputs[1];
-        res[5] = prime_outputs[5];
-        res[6] = prime_outputs[9];
-        res[7] = prime_outputs[13];
-        res[8] = prime_outputs[2];
-        res[9] = prime_outputs[6];
-        res[10] = prime_outputs[10];
-        res[11] = prime_outputs[14];
-        res[12] = prime_outputs[3];
-        res[13] = prime_outputs[7];
-        res[14] = prime_outputs[11];
-        res[15] = prime_outputs[15];
+        for coeff in 0..4 {
+            for prime in 0..4 {
+                res[4 * coeff + prime] = prime_outputs[4 * prime + coeff];
+            }
+        }
     }
 }
 
@@ -376,11 +389,12 @@ pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_avx2(
 // Block-pair, one column, two right-hand sides
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Applies one prepared-key column to two input digit spectra.
+/// Applies one prepared-key column to two input digit spectra, with the operands and output of
+/// [`vec_mat1col_product_blkpair_bbc_pm_avx2`].
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_x2_avx2(
-    meta: &BbcMeta<Primes30>,
+    _meta: &BbcMeta<Primes30>,
     ell: usize,
     res0: &mut [u64],
     res1: &mut [u64],
@@ -396,45 +410,38 @@ pub(crate) unsafe fn vec_mat1col_product_blkpair_bbc_pm_x2_avx2(
         assert!(x1_pm.len() >= 16 * ell);
         assert!(y_pm.len() >= y_pair_stride + 4 * ell);
 
-        let mask32 = _mm256_set1_epi64x(u32::MAX as i64);
-        let mask_h2 = _mm256_set1_epi64x(((1u64 << meta.h) - 1) as i64);
         let x_plane_stride = 4 * ell;
         let mut prime_outputs0 = [0u64; 16];
         let mut prime_outputs1 = [0u64; 16];
 
         for p in 0..4usize {
-            let s2l_pow_red = _mm256_set1_epi64x(meta.s2l_pow_red[p] as i64);
-            let s2h_pow_red = _mm256_set1_epi64x(meta.s2h_pow_red[p] as i64);
+            let q = _mm256_set1_epi64x(Q_VEC[p] as i64);
+            let qinv = _mm256_set1_epi64x(QINV[p] as i64);
             let x0_ptr = x0_pm.as_ptr().add(p * x_plane_stride) as *const __m256i;
             let x1_ptr = x1_pm.as_ptr().add(p * x_plane_stride) as *const __m256i;
             let y_ptr = y_pm.as_ptr().add((p / 2) * y_pair_stride) as *const __m256i;
             let odd_prime = p & 1 != 0;
-            let mut lo0 = _mm256_setzero_si256();
-            let mut hi0 = _mm256_setzero_si256();
-            let mut lo1 = _mm256_setzero_si256();
-            let mut hi1 = _mm256_setzero_si256();
-
-            for row in 0..ell {
-                let x0 = _mm256_loadu_si256(x0_ptr.add(row));
-                let x1 = _mm256_loadu_si256(x1_ptr.add(row));
-                let y = _mm256_loadu_si256(y_ptr.add(row));
-                let y = if odd_prime {
-                    _mm256_srli_epi64::<32>(y)
+            let (mut value0, mut value1) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+            let mut row = 0;
+            while row < ell {
+                let end = ell.min(row + CENTERED_ROWS);
+                let (mut acc0, mut acc1) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+                while row < end {
+                    let y = _mm256_loadu_si256(y_ptr.add(row));
+                    let y = if odd_prime { _mm256_srli_epi64::<32>(y) } else { y };
+                    acc0 = _mm256_add_epi64(acc0, _mm256_mul_epi32(_mm256_loadu_si256(x0_ptr.add(row)), y));
+                    acc1 = _mm256_add_epi64(acc1, _mm256_mul_epi32(_mm256_loadu_si256(x1_ptr.add(row)), y));
+                    row += 1;
+                }
+                let (r0, r1) = (signed_redc_canonical(acc0, q, qinv), signed_redc_canonical(acc1, q, qinv));
+                if end <= CENTERED_ROWS {
+                    (value0, value1) = (r0, r1);
                 } else {
-                    _mm256_and_si256(y, mask32)
-                };
-
-                for (x, lo, hi) in [(x0, &mut lo0, &mut hi0), (x1, &mut lo1, &mut hi1)] {
-                    let prod = _mm256_mul_epu32(x, y);
-                    *lo = _mm256_add_epi64(*lo, _mm256_and_si256(prod, mask32));
-                    *hi = _mm256_add_epi64(*hi, _mm256_srli_epi64::<32>(prod));
+                    (value0, value1) = (add_mod_canonical(value0, r0, q), add_mod_canonical(value1, r1, q));
                 }
             }
-
-            let out0 = reduce_bbc(lo0, hi0, mask_h2, meta.h, s2l_pow_red, s2h_pow_red);
-            let out1 = reduce_bbc(lo1, hi1, mask_h2, meta.h, s2l_pow_red, s2h_pow_red);
-            _mm256_storeu_si256(prime_outputs0.as_mut_ptr().add(4 * p) as *mut __m256i, out0);
-            _mm256_storeu_si256(prime_outputs1.as_mut_ptr().add(4 * p) as *mut __m256i, out1);
+            _mm256_storeu_si256(prime_outputs0.as_mut_ptr().add(4 * p) as *mut __m256i, value0);
+            _mm256_storeu_si256(prime_outputs1.as_mut_ptr().add(4 * p) as *mut __m256i, value1);
         }
 
         for (res, prime_outputs) in [(res0, prime_outputs0), (res1, prime_outputs1)] {
@@ -567,7 +574,6 @@ pub(crate) unsafe fn vec_mat2cols_product_x2_bbc_avx2(
 #[cfg(all(test, target_feature = "avx2"))]
 mod tests {
     use super::*;
-    use core::arch::x86_64::_mm256_set_epi64x;
     use poulpy_cpu_portable::kernels::ntt4x30::{
         arithmetic::{b_from_znx64_portable, c_from_b_portable},
         mat_vec::{
@@ -694,89 +700,93 @@ mod tests {
         assert_eq!(res_avx, res_ref, "vec_mat2cols_product_x2_bbc: AVX2 vs ref mismatch");
     }
 
+    /// The prime-major kernels against `Σ x * y mod q` in exact arithmetic, on centered operands spanning
+    /// `(-q/2, q/2]`, with more rows than an accumulator takes between two folds.
     #[test]
-    fn vec_mat1col_product_blkpair_bbc_pm_avx2_vs_ref() {
-        let ell = 8usize;
+    fn vec_mat1col_product_blkpair_bbc_pm_avx2_vs_exact() {
         let meta = BbcMeta::<Primes30>::new();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for ell in [1usize, 8, 16, 17, 40] {
+            // Centered residue of prime p, per plane p, row and lane (lane order of the planes).
+            let mut draw = |p: usize| {
+                let q = Q_VEC[p] as i64;
+                (next() % Q_VEC[p]) as i64 - q / 2
+            };
+            let x: Vec<[[i64; 4]; 4]> = (0..ell)
+                .map(|_| std::array::from_fn(|p| std::array::from_fn(|_| draw(p))))
+                .collect();
+            let x1: Vec<[[i64; 4]; 4]> = (0..ell)
+                .map(|_| std::array::from_fn(|p| std::array::from_fn(|_| draw(p))))
+                .collect();
+            let y: Vec<[[i64; 4]; 4]> = (0..ell)
+                .map(|_| std::array::from_fn(|p| std::array::from_fn(|_| draw(p))))
+                .collect();
 
-        let coeffs_x: Vec<i64> = (0..ell * 4).map(|i| (i as i64 * 7 + 5) % 53 + 1).collect();
-        let coeffs_y: Vec<i64> = (0..ell * 4).map(|i| (i as i64 * 11 + 3) % 59 + 1).collect();
-
-        let mut x_b = vec![0u64; 16 * ell];
-        let mut y_b = vec![0u64; 16 * ell];
-        b_from_znx64_portable::<Primes30>(ell * 4, &mut x_b, &coeffs_x);
-        b_from_znx64_portable::<Primes30>(ell * 4, &mut y_b, &coeffs_y);
-
-        let mut y_c = vec![0u32; 32 * ell];
-        c_from_b_portable::<Primes30>(ell * 4, &mut y_c, &y_b);
-        let x_b_u32 = b_to_u32(&x_b);
-
-        let x_pm: Vec<u64> = {
-            let plane_stride = 4 * ell;
-            let mut out = vec![0u64; 4 * plane_stride];
-            for row in 0..ell {
-                let row_base = row * 16;
-                for p in 0..4usize {
-                    let dst = out.as_mut_ptr().wrapping_add(p * plane_stride + row * 4) as *mut __m256i;
-                    unsafe {
-                        _mm256_storeu_si256(
-                            dst,
-                            _mm256_set_epi64x(
-                                x_b[row_base + 12 + p] as i64,
-                                x_b[row_base + 8 + p] as i64,
-                                x_b[row_base + 4 + p] as i64,
-                                x_b[row_base + p] as i64,
-                            ),
-                        );
+            let plane = |v: &[[[i64; 4]; 4]]| -> Vec<u64> {
+                let mut out = vec![0u64; 16 * ell];
+                for (row, r) in v.iter().enumerate() {
+                    for p in 0..4 {
+                        for lane in 0..4 {
+                            out[p * 4 * ell + row * 4 + lane] = r[p][lane] as u64;
+                        }
+                    }
+                }
+                out
+            };
+            let (x_pm, x1_pm) = (plane(&x), plane(&x1));
+            let mut y_pm = vec![0u64; 8 * ell];
+            for (row, r) in y.iter().enumerate() {
+                for pair in 0..2 {
+                    for lane in 0..4 {
+                        // Montgomery form `y * 2^32 mod q`, centered, as the prepare kernel stores it.
+                        let mont = |p: usize| {
+                            let q = Q_VEC[p] as i128;
+                            let m = ((r[p][lane] as i128) << 32).rem_euclid(q) as i64;
+                            if m > (q / 2) as i64 { m - q as i64 } else { m }
+                        };
+                        y_pm[pair * 4 * ell + row * 4 + lane] =
+                            mont(2 * pair) as u32 as u64 | ((mont(2 * pair + 1) as u32 as u64) << 32);
                     }
                 }
             }
-            out
-        };
 
-        let y_pm: Vec<u64> = {
-            let pair_stride = 4 * ell;
-            let mut out = vec![0u64; 2 * pair_stride];
-            for row in 0..ell {
-                for pair in 0..2usize {
-                    let p = 2 * pair;
-                    for coeff in 0..4usize {
-                        let src = row * 32 + coeff * 8 + 2 * p;
-                        out[pair * pair_stride + row * 4 + coeff] = y_c[src] as u64 | ((y_c[src + 2] as u64) << 32);
+            // Output layout: res[4 * lane + p].
+            let exact = |x: &[[[i64; 4]; 4]]| -> Vec<u64> {
+                let mut out = vec![0u64; 16];
+                for lane in 0..4 {
+                    for p in 0..4 {
+                        let sum: i128 = (0..ell).map(|row| x[row][p][lane] as i128 * y[row][p][lane] as i128).sum();
+                        out[4 * lane + p] = sum.rem_euclid(Q_VEC[p] as i128) as u64;
                     }
                 }
-            }
-            out
-        };
+                out
+            };
+            let reduced = |res: &[u64]| -> Vec<u64> {
+                res.iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        assert!(v < Q_VEC[i % 4] << 33, "ell={ell}: output {i} out of the q120b range");
+                        v % Q_VEC[i % 4]
+                    })
+                    .collect()
+            };
 
-        let mut res_avx = vec![0u64; 16];
-        unsafe { vec_mat1col_product_blkpair_bbc_pm_avx2(&meta, ell, &mut res_avx, &x_pm, &y_pm, 4 * ell) };
+            let mut res = vec![0u64; 16];
+            unsafe { vec_mat1col_product_blkpair_bbc_pm_avx2(&meta, ell, &mut res, &x_pm, &y_pm, 4 * ell) };
+            assert_eq!(reduced(&res), exact(&x), "ell={ell}");
 
-        let mut res_ref = vec![0u64; 16];
-        for coeff in 0..4usize {
-            let x_coeff: Vec<u32> = (0..ell)
-                .flat_map(|row| x_b_u32[row * 32 + coeff * 8..row * 32 + (coeff + 1) * 8].iter().copied())
-                .collect();
-            let y_coeff: Vec<u32> = (0..ell)
-                .flat_map(|row| y_c[row * 32 + coeff * 8..row * 32 + (coeff + 1) * 8].iter().copied())
-                .collect();
-            vec_mat1col_product_bbc_portable::<Primes30>(
-                &meta,
-                ell,
-                &mut res_ref[4 * coeff..4 * (coeff + 1)],
-                &x_coeff,
-                &y_coeff,
-            );
+            let (mut res0, mut res1) = (vec![0u64; 16], vec![0u64; 16]);
+            unsafe {
+                vec_mat1col_product_blkpair_bbc_pm_x2_avx2(&meta, ell, &mut res0, &mut res1, &x_pm, &x1_pm, &y_pm, 4 * ell)
+            };
+            assert_eq!(reduced(&res0), exact(&x), "ell={ell}: x2, first");
+            assert_eq!(reduced(&res1), exact(&x1), "ell={ell}: x2, second");
         }
-
-        assert_eq!(res_avx, res_ref, "vec_mat1col_product_blkpair_bbc_pm: AVX2 vs ref mismatch");
-
-        let mut res_pair0 = vec![0u64; 16];
-        let mut res_pair1 = vec![0u64; 16];
-        unsafe {
-            vec_mat1col_product_blkpair_bbc_pm_x2_avx2(&meta, ell, &mut res_pair0, &mut res_pair1, &x_pm, &x_pm, &y_pm, 4 * ell)
-        };
-        assert_eq!(res_pair0, res_ref);
-        assert_eq!(res_pair1, res_ref);
     }
 }
